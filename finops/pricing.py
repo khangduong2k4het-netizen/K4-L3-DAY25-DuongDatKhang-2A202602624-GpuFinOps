@@ -5,6 +5,8 @@ live prices as fast-moving (re-baseline before each cohort).
 """
 from __future__ import annotations
 
+import math
+
 
 def request_cost(
     input_tok: int,
@@ -36,6 +38,42 @@ def dollars_per_million(total_cost_usd: float, total_tokens: int) -> float:
     return total_cost_usd / (total_tokens / 1e6)
 
 
+# Anthropic prompt caching: write = 1.25x base input (5-min TTL) or 2x (1-hour
+# TTL); read = 0.1x. Other providers differ (e.g. Gemini bills storage per hour).
+CACHE_WRITE_MULT_5M = 1.25
+CACHE_WRITE_MULT_1H = 2.0
+
+
+def cache_break_even_reads(write_mult: float = CACHE_WRITE_MULT_5M, read_discount: float = 0.10) -> float:
+    """Reads per written prefix at which caching costs the same as not caching.
+
+    One prefix, written once then read R times (prices relative to base input):
+      cached   = write_mult + R * read_discount
+      uncached = 1 + R
+    Equal at R* = (write_mult - 1) / (1 - read_discount).  1.25x/0.1x -> R* ~ 0.28.
+    """
+    if read_discount >= 1.0:
+        return float("inf")
+    return max(0.0, write_mult - 1.0) / (1.0 - read_discount)
+
+
+def cache_cost_multiplier(avg_cache_reads: float, write_mult: float = CACHE_WRITE_MULT_5M,
+                          read_discount: float = 0.10) -> float:
+    """Effective price multiplier on cacheable input tokens, write cost included.
+
+    Averaged over the 1 write + R reads that share a prefix:
+    (write_mult + R * read_discount) / (R + 1).  -> read_discount as R -> inf.
+    """
+    r = max(0.0, avg_cache_reads)
+    return (write_mult + r * read_discount) / (r + 1.0)
+
+
+def cache_is_worth_it(avg_cache_reads: float, write_mult: float = CACHE_WRITE_MULT_5M,
+                      read_discount: float = 0.10) -> bool:
+    """Cache only pays when read savings outweigh the write premium (R > R*)."""
+    return cache_cost_multiplier(avg_cache_reads, write_mult, read_discount) < 1.0
+
+
 def discount_stack(
     batch: bool = False,
     cache_hit_frac: float = 0.0,
@@ -60,14 +98,101 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Per-hour spot interruption probability by GPU type. ASSUMPTION (no live feed in
+# the lab data): deck gives H100 spot "<5%"; newest/largest SKUs sit in deep
+# neocloud pools, while A10G/L4 share capacity with popular general-purpose
+# instance families and get reclaimed more often (cf. AWS Spot Instance Advisor
+# frequency buckets). Re-baseline from your provider's spot history before acting.
+SPOT_INTERRUPT_RATE = {
+    "H100": 0.03, "H200": 0.03, "B200": 0.04,
+    "A100": 0.05, "MI300X": 0.05,
+    "L4": 0.08, "A10G": 0.10,
+}
+DEFAULT_INTERRUPT_RATE = 0.05
+MAX_SPOT_INTERRUPT_RATE = 0.15   # above this, rework makes spot operationally painful
+RESERVED_TERMS = {"1yr": (12, "reserved_1yr_hr"), "3yr": (36, "reserved_3yr_hr")}
+
+
+def reserved_waste_factor(horizon_months: float, term_months: int) -> float:
+    """Months paid / months needed when a commitment outlives the need.
+
+    A 3yr term bought for a 24-month need pays 36/24 = 1.5x; 1yr terms renew in
+    whole years, so an 18-month need pays 24/18.
+    """
+    if horizon_months <= 0:
+        return float("inf")
+    terms = math.ceil(horizon_months / term_months)
+    return terms * term_months / horizon_months
+
+
+def purchasing_options(
+    hours_per_day: float,
+    days: float,
+    num_gpus: int,
+    prices: dict,
+    interruptible: bool,
+    gpu_type: str | None = None,
+    horizon_months: float = 0.0,
+) -> dict:
+    """Monthly cost of every eligible way to buy this job's GPU-hours.
+
+    Keys: 'on_demand', 'spot', 'reserved_1yr', 'reserved_3yr'.
+      - spot: only if interruptible and the GPU's interrupt rate is tolerable;
+        priced with the checkpoint/rework simulation at that GPU's rate.
+      - reserved: a commitment bills 24h/day whether used or not, and the whole
+        term even if the need ends earlier (see reserved_waste_factor).
+    """
+    od_hr = float(prices["on_demand_hr"])
+    used_hours = max(0.0, hours_per_day) * days * num_gpus
+    opts = {"on_demand": used_hours * od_hr}
+
+    rate = SPOT_INTERRUPT_RATE.get(gpu_type, DEFAULT_INTERRUPT_RATE)
+    if interruptible and rate <= MAX_SPOT_INTERRUPT_RATE:
+        sim = spot_checkpoint_cost(used_hours, float(prices["spot_hr"]), od_hr, interrupt_rate=rate)
+        opts["spot"] = sim["spot_cost"]
+
+    if horizon_months > 0:
+        committed_hours = 24.0 * days * num_gpus
+        for term, (months, col) in RESERVED_TERMS.items():
+            opts[f"reserved_{term}"] = (committed_hours * float(prices[col])
+                                        * reserved_waste_factor(horizon_months, months))
+    return opts
+
+
+def best_purchasing_option(**kwargs) -> tuple[str, str, float]:
+    """(tier, term, monthly_cost) of the cheapest option; on_demand wins ties."""
+    opts = purchasing_options(**kwargs)
+    best = min(opts, key=lambda k: (round(opts[k], 6), k != "on_demand"))
+    tier, _, term = best.partition("_") if best.startswith("reserved") else (best, "", "")
+    return tier, term, opts[best]
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    prices: dict | None = None,
+    days: float = 30,
+    num_gpus: int = 1,
+    horizon_months: float = 0.0,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+    With `prices` (a price_catalog row): cost-based — cheapest of purchasing_options,
+    which accounts for per-GPU spot interruption rates and 1yr/3yr commitments
+    over `horizon_months`. Use best_purchasing_option() to also get the term.
+
+    Without `prices`, the DOCUMENTED simple policy:
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
     """
+    if prices is not None:
+        tier, _, _ = best_purchasing_option(
+            hours_per_day=hours_per_day, days=days, num_gpus=num_gpus, prices=prices,
+            interruptible=interruptible, gpu_type=gpu_type, horizon_months=horizon_months)
+        return tier
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
     if interruptible and hours_per_day < 24:
